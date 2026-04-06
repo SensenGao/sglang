@@ -757,7 +757,34 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         mrope_positions_list = [[]] * batch_size
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
-            if self.forward_mode.is_decode():
+            if self.forward_mode.is_dllm_extend():
+                # dLLM block decode: generate incremental positions for
+                # the mask tokens.  For VLM requests the mrope_position_delta
+                # (set during prompt prefill) must be added so that text
+                # positions after vision tokens are consistent with the
+                # positions used during prefill.
+                extend_seq_len = batch.extend_seq_lens[batch_idx]
+                extend_prefix_len = batch.extend_prefix_lens[batch_idx]
+                delta = 0
+                if (
+                    mm_input is not None
+                    and getattr(mm_input, "mrope_position_delta", None)
+                    is not None
+                ):
+                    delta = int(mm_input.mrope_position_delta.flatten().item())
+                mrope_positions = torch.tensor(
+                    [
+                        list(
+                            range(
+                                extend_prefix_len + delta,
+                                extend_prefix_len + delta + extend_seq_len,
+                            )
+                        )
+                    ]
+                    * 3
+                )
+                mrope_positions_list[batch_idx] = mrope_positions
+            elif self.forward_mode.is_decode():
                 # 3 * N
                 if (
                     mm_input is None
