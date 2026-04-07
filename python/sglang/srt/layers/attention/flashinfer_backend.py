@@ -137,6 +137,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
+        self.dllm_ragged_custom_mask = None
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -550,6 +551,39 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
+        # --- dLLM speculative: ragged wrapper with custom_mask support ---
+        # Allows switching between bidirectional (draft) and causal (verify)
+        # attention within the SAME CUDA graph by only updating the mask buffer.
+        self.dllm_ragged_custom_mask = None
+        if self.is_dllm_model and self.dllm_config is not None:
+            block_size = self.dllm_config.block_size
+            max_bs = max(1, max_num_tokens // block_size)
+            # Pre-allocate ragged mask buffer (initialised to all-1 = bidirectional)
+            self.dllm_ragged_custom_mask = torch.ones(
+                max_bs * block_size * block_size,
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            ragged_indptr = torch.zeros(max_bs + 1, dtype=torch.int32, device="cuda")
+            self.dllm_ragged_mask_indptr = torch.zeros(
+                max_bs + 1, dtype=torch.int32, device="cuda"
+            )
+            fmha_backend = "auto"
+            if is_sm100_supported() and not getattr(
+                self, "_disable_cutlass", False
+            ):
+                fmha_backend = "cutlass"
+            self.dllm_spec_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend=fmha_backend,
+                use_cuda_graph=True,
+                qo_indptr_buf=ragged_indptr,
+                kv_indptr_buf=ragged_indptr.clone(),
+                custom_mask_buf=self.dllm_ragged_custom_mask,
+                mask_indptr_buf=self.dllm_ragged_mask_indptr,
+            )
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -672,6 +706,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
+            # If a custom-mask ragged wrapper exists, swap it in for capture
+            # so the CUDA graph records the custom-mask kernel path.
+            if self.dllm_ragged_custom_mask is not None:
+                self.indices_updater_prefill.prefill_wrapper_ragged = (
+                    self.dllm_spec_wrapper_ragged
+                )
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
@@ -682,6 +722,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=True,
                 encoder_lens=encoder_lens,
                 spec_info=None,
+                ragged_custom_mask=self.dllm_ragged_custom_mask,
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
@@ -746,6 +787,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=True,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
+                ragged_custom_mask=self.dllm_ragged_custom_mask,
             )
         else:
             raise ValueError("Invalid forward mode")
@@ -824,11 +866,20 @@ class FlashInferAttnBackend(AttentionBackend):
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
+            # Select ragged wrapper: use custom-mask version for dLLM CUDA graph
+            ragged_wrapper = self.prefill_wrapper_ragged
+            if (
+                self.dllm_ragged_custom_mask is not None
+                and forward_batch.forward_mode.is_dllm_extend()
+            ):
+                ragged_wrapper = self.dllm_spec_wrapper_ragged
+                causal = False  # custom_mask controls the attention pattern
+
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
-                o = self.prefill_wrapper_ragged.forward(
+                o = ragged_wrapper.forward(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
@@ -843,7 +894,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     # For other models, use causal attention for the ragged part as previously
                     causal = True
 
-                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                o1, s1 = ragged_wrapper.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
@@ -1227,6 +1278,7 @@ class FlashInferIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
+        ragged_custom_mask: Optional[torch.Tensor] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1244,6 +1296,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        ragged_custom_mask: Optional[torch.Tensor] = None,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -1254,8 +1307,13 @@ class FlashInferIndicesUpdaterPrefill:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
 
+        # For dLLM speculative: use the custom-mask ragged wrapper
+        ragged_wrapper = self.prefill_wrapper_ragged
+        if ragged_custom_mask is not None and hasattr(self.attn_backend, "dllm_spec_wrapper_ragged"):
+            ragged_wrapper = self.attn_backend.dllm_spec_wrapper_ragged
+
         self.call_begin_forward(
-            self.prefill_wrapper_ragged,
+            ragged_wrapper,
             prefill_wrappers[0],
             req_pool_indices,
             paged_kernel_lens,
@@ -1269,6 +1327,7 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            ragged_custom_mask=ragged_custom_mask,
         )
 
     def update_sliding_window(
@@ -1379,6 +1438,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        ragged_custom_mask: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1456,6 +1516,9 @@ class FlashInferIndicesUpdaterPrefill:
 
         # extend part
         if use_ragged:
+            ragged_kwargs = {}
+            if ragged_custom_mask is not None:
+                ragged_kwargs["custom_mask"] = ragged_custom_mask
             wrapper_ragged.begin_forward(
                 qo_indptr,
                 qo_indptr,
@@ -1463,6 +1526,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
+                **ragged_kwargs,
             )
 
         if use_sliding_window_kv_pool:

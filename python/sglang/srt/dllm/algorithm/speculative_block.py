@@ -1,22 +1,24 @@
-"""Speculative block decoding for dLLM.
+"""Speculative block decoding for dLLM  (single CUDA-graph, custom-mask).
 
-Two-phase design per block:
-  Phase 1 — Draft (bidirectional):  ENCODER_ONLY attention, CUDA Graph
-  Phase 2 — Verify (causal / AR):   DECODER attention, eager forward
+One CUDA graph is captured (ENCODER_ONLY).  The ragged wrapper is
+created with a ``custom_mask_buf`` so the attention pattern can be
+switched between bidirectional and causal by writing to the buffer:
+
+  Draft:   mask = all-1  (bidirectional)  ->  CUDA Graph replay
+  Verify:  mask = tril   (causal / AR)    ->  same CUDA Graph replay
 
 After AR verification the longest matching prefix is accepted and
-rejected KV slots are freed by the scheduler.
+rejected KV slots are freed.
 """
 
 import logging
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -24,13 +26,6 @@ logger = logging.getLogger(__name__)
 
 
 class SpeculativeBlock(DllmAlgorithm):
-    """Speculative block decoding with draft-then-verify.
-
-    Attention type switching (matches original HF implementation):
-      - Prefill (EXTEND mode):   DECODER (causal)   — handled by model default
-      - Draft phase:              ENCODER_ONLY (bidirectional) — CUDA Graph
-      - Verify phase:             DECODER (causal)   — eager (forward_extend)
-    """
 
     def __init__(self, config: DllmConfig):
         super().__init__(config)
@@ -39,26 +34,32 @@ class SpeculativeBlock(DllmAlgorithm):
         self.last_inherited_token = None
         self.last_block_end_position = None
 
-    @staticmethod
-    def _set_attention_type(model_runner: ModelRunner, attn_type: AttentionType):
-        """Switch attention type on all language model layers."""
-        model = model_runner.model
-        layers = None
-        if hasattr(model, "model") and hasattr(model.model, "layers"):
-            layers = model.model.layers
-        elif hasattr(model, "layers"):
-            layers = model.layers
-        if layers is None:
-            return
-        for layer in layers:
-            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "attn"):
-                layer.self_attn.attn.attn_type = attn_type
+        # Pre-compute causal mask (lower triangular) for the block
+        B = self.block_size
+        self._causal_mask = torch.tril(
+            torch.ones(B, B, dtype=torch.uint8)
+        ).flatten()
+        self._bidir_mask = torch.ones(B * B, dtype=torch.uint8)
 
+    # ------------------------------------------------------------------
+    def _write_mask(self, model_runner: ModelRunner, causal: bool):
+        """Write bidirectional or causal mask into the ragged custom_mask buffer."""
+        buf = model_runner.attn_backend.dllm_ragged_custom_mask
+        if buf is None:
+            return
+        src = self._causal_mask if causal else self._bidir_mask
+        src = src.to(buf.device, non_blocking=True)
+        n = src.numel()
+        buf[:n].copy_(src, non_blocking=True)
+
+    # ------------------------------------------------------------------
     def run(
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
-    ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
+    ) -> Tuple[
+        Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool
+    ]:
         batch_size = forward_batch.batch_size
         tokens_per_req = self.block_size
         total_len = len(forward_batch.input_ids)
@@ -73,10 +74,7 @@ class SpeculativeBlock(DllmAlgorithm):
 
         # --- detect new request & clear state ---
         is_new_request = False
-        if (
-            hasattr(forward_batch, "positions")
-            and forward_batch.positions is not None
-        ):
+        if hasattr(forward_batch, "positions") and forward_batch.positions is not None:
             if forward_batch.positions[0] == 0:
                 is_new_request = True
                 self.last_inherited_token = None
@@ -93,9 +91,9 @@ class SpeculativeBlock(DllmAlgorithm):
                 forward_batch.input_ids[base] = self.last_inherited_token
 
         # ==============================================================
-        # Phase 1 – Draft  (bidirectional attention, CUDA Graph)
+        # Phase 1 - Draft  (bidirectional mask, CUDA Graph)
         # ==============================================================
-        self._set_attention_type(model_runner, AttentionType.ENCODER_ONLY)
+        self._write_mask(model_runner, causal=False)
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         can_run_cuda_graph = out.can_run_graph
@@ -116,23 +114,19 @@ class SpeculativeBlock(DllmAlgorithm):
         forward_batch.input_ids[mask_pos] = draft_preds[mask_pos]
 
         # ==============================================================
-        # Phase 2 – Verify  (causal attention, eager forward)
+        # Phase 2 - Verify  (causal mask, same CUDA Graph)
         # ==============================================================
-        self._set_attention_type(model_runner, AttentionType.DECODER)
+        self._write_mask(model_runner, causal=True)
 
-        verify_out = model_runner.forward_extend(
-            forward_batch, pp_proxy_tensors=None
-        )
-        if isinstance(verify_out, tuple):
-            verify_out = verify_out[0]
-        logits_output = verify_out
+        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        logits_output = out.logits_output
         verify_logits = logits_output.full_logits
         assert verify_logits is not None
 
         ar_tokens = verify_logits.argmax(dim=-1)
 
-        # --- Restore ENCODER_ONLY for next block's draft phase ---
-        self._set_attention_type(model_runner, AttentionType.ENCODER_ONLY)
+        # --- restore bidirectional mask for next block's first (draft) call ---
+        self._write_mask(model_runner, causal=False)
 
         # --- Per-request AR comparison and acceptance ---
         next_token_ids_list = []
@@ -171,10 +165,7 @@ class SpeculativeBlock(DllmAlgorithm):
                 )
 
         # --- position tracking ---
-        if (
-            hasattr(forward_batch, "positions")
-            and forward_batch.positions is not None
-        ):
+        if hasattr(forward_batch, "positions") and forward_batch.positions is not None:
             self.last_block_end_position = forward_batch.positions[-1].item()
 
         return logits_output, next_token_ids_list, can_run_cuda_graph
