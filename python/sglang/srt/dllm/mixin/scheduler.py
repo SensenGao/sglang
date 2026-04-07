@@ -89,22 +89,15 @@ class SchedulerDllmMixin:
                     release_kv_cache(req, self.tree_cache)
                     req.time_stats.set_completion_time()
                 else:
-                    # Truncate KV cache for rejected tokens when speculative
-                    # decoding partially accepts (new_tokens < block_size).
-                    # The KV cache was allocated for the full fill_ids
-                    # (prompt + block_size masks), but only
-                    # (prompt + output_ids) worth of KV should be kept.
+                    # Sync fill_ids and KV tracking for partial acceptance.
+                    # KV cache slots for rejected tokens are already freed
+                    # by the algorithm (SpeculativeBlock._free_rejected_kv),
+                    # aligning with how Eagle frees in its verify() method.
                     expected_kv_len = len(req.origin_input_ids) + len(
                         req.output_ids
                     )
                     actual_kv_len = len(req.fill_ids)
                     if actual_kv_len > expected_kv_len:
-                        rejected_kv_locs = self.req_to_token_pool.req_to_token[
-                            req.req_pool_idx,
-                            expected_kv_len:actual_kv_len,
-                        ]
-                        self.token_to_kv_pool_allocator.free(rejected_kv_locs)
-                        # Sync fill_ids and KV tracking with actual length
                         req.fill_ids = req.fill_ids[:expected_kv_len]
                         req.kv_committed_len = expected_kv_len
                         req.kv_allocated_len = expected_kv_len

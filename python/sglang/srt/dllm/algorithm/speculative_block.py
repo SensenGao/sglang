@@ -53,6 +53,42 @@ class SpeculativeBlock(DllmAlgorithm):
         buf[:n].copy_(src, non_blocking=True)
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _free_rejected_kv(
+        model_runner: ModelRunner,
+        forward_batch: ForwardBatch,
+        req_idx: int,
+        accepted_num: int,
+        tokens_per_req: int,
+    ):
+        """Free KV cache slots for rejected (unaccepted) tokens.
+
+        After the verify phase, the KV cache contains entries for the full
+        block (tokens_per_req positions).  Only the first ``accepted_num``
+        positions are valid; the rest must be freed so that the scheduler's
+        KV bookkeeping stays consistent.  This mirrors how Eagle frees
+        unaccepted KV slots inside its ``verify()`` method.
+        """
+        if accepted_num >= tokens_per_req:
+            return  # all accepted, nothing to free
+
+        seq_len = forward_batch.seq_lens[req_idx].item()
+        # KV positions are [0, seq_len). The block occupies the last
+        # tokens_per_req positions. Rejected positions start at
+        # (seq_len - tokens_per_req + accepted_num).
+        reject_start = seq_len - tokens_per_req + accepted_num
+        reject_end = seq_len
+
+        if reject_start >= reject_end:
+            return
+
+        req_pool_idx = forward_batch.req_pool_indices[req_idx].item()
+        rejected_kv_locs = model_runner.req_to_token_pool.req_to_token[
+            req_pool_idx, reject_start:reject_end
+        ]
+        model_runner.token_to_kv_pool_allocator.free(rejected_kv_locs)
+
+    # ------------------------------------------------------------------
     def run(
         self,
         model_runner: ModelRunner,
@@ -151,6 +187,11 @@ class SpeculativeBlock(DllmAlgorithm):
             else:
                 output_count = max(accepted_num - start_list[i], 0)
                 self.last_inherited_token = ar_tokens[base + accepted_num - 1].item()
+
+            # Free KV cache for rejected tokens (aligns with Eagle's approach)
+            self._free_rejected_kv(
+                model_runner, forward_batch, i, accepted_num, tokens_per_req
+            )
 
             next_token_ids = forward_batch.input_ids[
                 block_start : block_start + output_count
